@@ -290,7 +290,7 @@ def parse_demographics_segments(df: pd.DataFrame) -> pd.DataFrame:
     })
     out = compute_kpis(out)  # adds ctr
     # Share of impressions within each segment
-    out["share_impressions"] = out.groupby("dimension_type")["impressions"].apply(lambda s: s / s.sum())
+    out["share_impressions"] = out["impressions"] / out.groupby("dimension_type")["impressions"].transform("sum")
     return out
 
 # =============================================================================
