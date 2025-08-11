@@ -661,8 +661,8 @@ def run_streamlit_app():
         st.download_button("Download table (CSV)", data=cr.to_csv(index=False).encode("utf-8"), file_name="creative_breakdown.csv", mime="text/csv")
 
     if not df_demo.empty:
-    st.markdown("---")
-    st.subheader("Demographics")
+        st.markdown("---")
+        st.subheader("Demographics")
 
     # If we have the parsed long-form structure
     if {"dimension_type","dimension_value"}.issubset(df_demo.columns):
