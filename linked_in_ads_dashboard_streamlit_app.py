@@ -204,6 +204,94 @@ def dedupe(df: pd.DataFrame, keys: List[str]) -> Tuple[pd.DataFrame, pd.DataFram
     })
     return out, report
 
+# =============================================================================
+# Demographics (segment-style) parsing helpers
+# =============================================================================
+
+def _normalize_text(s: Optional[str]) -> str:
+    if s is None:
+        return ""
+    return str(s).strip()
+
+# Map regex -> canonical segment key
+SEGMENT_REGEX_MAP = {
+    r"^company\s+name\s+segment$": "company",
+    r"^company\s+industry\s+segment$": "industry",
+    r"^job\s+seniority\s+segment$": "seniority",
+    r"^job\s+title\s+segment$": "job_title",
+    r"^job\s+function\s+segment$": "job_function",
+}
+
+DROP_LABELS = {"total", "other", "unknown", "not specified", "not\xa0specified"}
+
+def has_demographic_segments(df: pd.DataFrame) -> bool:
+    if df.empty:
+        return False
+    first_col = df.columns[0]
+    vals = df[first_col].astype(str).str.strip().str.lower().fillna("")
+    import re
+    for pat in SEGMENT_REGEX_MAP.keys():
+        if vals.str.match(pat, case=False, regex=True).any():
+            return True
+    return False
+
+def parse_demographics_segments(df: pd.DataFrame) -> pd.DataFrame:
+    """Parse a demographics sheet where the FIRST column holds segment headers and values.
+    Returns columns: dimension_type, dimension_value, impressions, clicks, ctr, share_impressions.
+    Auto-drops Total/Other/Unknown/Not Specified.
+    """
+    if df.empty:
+        return df
+    # Ensure canonical metric names
+    df = canonicalize_columns(df, DEFAULT_MAPPING)
+    label_col = df.columns[0]
+    # prefer canonical metric columns if present
+    impressions = df.get("impressions")
+    clicks = df.get("clicks")
+    # If metrics are missing, initialize as NaN to avoid crashes; CTR will be NaN
+    if impressions is None:
+        impressions = pd.Series(np.nan, index=df.index)
+    if clicks is None:
+        clicks = pd.Series(np.nan, index=df.index)
+
+    rows = []
+    current_segment = None
+    import re
+    for i, raw_label in enumerate(df[label_col].astype(str).fillna("")):
+        label = raw_label.strip()
+        low = label.lower()
+        # Is this a segment header?
+        seg_hit = None
+        for pat, seg in SEGMENT_REGEX_MAP.items():
+            if re.match(pat, low, flags=re.IGNORECASE):
+                seg_hit = seg
+                break
+        if seg_hit:
+            current_segment = seg_hit
+            continue
+        # Skip empties or when we haven't seen a segment yet
+        if not label or current_segment is None:
+            continue
+        # Drop aggregate/unknown buckets
+        if low in DROP_LABELS:
+            continue
+        rows.append({
+            "dimension_type": current_segment,
+            "dimension_value": label,
+            "impressions": pd.to_numeric(impressions.iloc[i], errors="coerce"),
+            "clicks": pd.to_numeric(clicks.iloc[i], errors="coerce"),
+        })
+    if not rows:
+        return pd.DataFrame(columns=["dimension_type","dimension_value","impressions","clicks","ctr","share_impressions"])
+    out = pd.DataFrame(rows)
+    # Aggregate dupes that might occur across files
+    out = out.groupby(["dimension_type","dimension_value"], as_index=False).agg({
+        "impressions":"sum","clicks":"sum"
+    })
+    out = compute_kpis(out)  # adds ctr
+    # Share of impressions within each segment
+    out["share_impressions"] = out.groupby("dimension_type")["impressions"].apply(lambda s: s / s.sum())
+    return out
 
 # =============================================================================
 # File ingestion (shared by Streamlit & headless)
@@ -320,9 +408,12 @@ def load_files_from_paths(paths: List[str], mapping: Dict[str, List[str]]):
         elif ftype == "conversation":
             convo.append(df)
         elif ftype == "demographics":
-            demo.append(df)
+            # If the first column holds segment headers, parse that structure
+            parsed = parse_demographics_segments(raw) if has_demographic_segments(raw) else df
+            demo.append(parsed)
         else:
             campaign.append(df)
+
 
     def _concat(parts: List[pd.DataFrame]) -> pd.DataFrame:
         return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
@@ -569,26 +660,70 @@ def run_streamlit_app():
         st.dataframe(cr[keep].sort_values("impressions", ascending=False), use_container_width=True)
         st.download_button("Download table (CSV)", data=cr.to_csv(index=False).encode("utf-8"), file_name="creative_breakdown.csv", mime="text/csv")
 
-    if not df_demo.empty and PLOTLY_AVAILABLE:
-        st.markdown("---")
-        st.subheader("Demographics")
-        demo_kpi = compute_kpis(df_demo.copy())
-        dim_candidates = ["dimension_value","company","industry","job_function","job_title","seniority","company_size","country"]
-        dim_col = st.selectbox("Dimension", [c for c in dim_candidates if c in demo_kpi.columns])
-        metric = st.selectbox("Metric", [c for c in ["impressions","clicks","spend","conversions","ctr","cpc","cpm","cvr","cpl"] if c in demo_kpi.columns], index=0)
-        cat_col = "dimension_value" if "dimension_value" in demo_kpi.columns else dim_col
-        grp = demo_kpi.groupby(cat_col, as_index=False).agg({
-            "impressions":"sum","clicks":"sum","spend":"sum","conversions":"sum"
-        })
-        grp = compute_kpis(grp)
-        top = grp.sort_values(metric, ascending=False).head(20)
-        fig3 = px.bar(top, x=cat_col, y=metric)
-        fig3.update_layout(height=420, margin=dict(l=8,r=8,b=120,t=40))
-        st.plotly_chart(fig3, use_container_width=True)
-        st.caption("Full table")
-        st.dataframe(grp.sort_values(metric, ascending=False), use_container_width=True)
-        if KALEIDO_AVAILABLE:
-            st.download_button("Download chart (PNG)", data=fig3.to_image(format="png"), file_name=f"demo_{metric}.png", mime="image/png")
+    if not df_demo.empty:
+    st.markdown("---")
+    st.subheader("Demographics")
+
+    # If we have the parsed long-form structure
+    if {"dimension_type","dimension_value"}.issubset(df_demo.columns):
+        # Keep only the requested segments
+        keep_order = ["company","industry","seniority","job_title","job_function"]
+        segments = [s for s in keep_order if s in df_demo["dimension_type"].unique().tolist()]
+        tab_labels = {
+            "company":"By Company",
+            "industry":"By Industry",
+            "seniority":"By Seniority",
+            "job_title":"By Job Title",
+            "job_function":"By Job Function",
+        }
+        tabs = st.tabs([tab_labels.get(s, s.title()) for s in segments] or ["Demographics"])
+
+        for t, seg in zip(tabs, segments):
+            with t:
+                sub = df_demo[df_demo["dimension_type"]==seg].copy()
+                # sort by impressions desc
+                sub = sub.sort_values("impressions", ascending=False)
+                # pretty columns for view
+                if "ctr" in sub.columns:
+                    sub["CTR %"] = sub["ctr"] * 100
+                if "share_impressions" in sub.columns:
+                    sub["Share of Impr. %"] = sub["share_impressions"] * 100
+                view_cols = ["dimension_value","impressions","clicks"]
+                if "CTR %" in sub.columns: view_cols.append("CTR %")
+                if "Share of Impr. %" in sub.columns: view_cols.append("Share of Impr. %")
+                st.dataframe(sub[view_cols].rename(columns={"dimension_value":"Label"}), use_container_width=True)
+
+                if PLOTLY_AVAILABLE:
+                    top = sub.head(20)
+                    fig = px.bar(top, x="dimension_value", y="impressions", title=f"Top {min(20,len(top))} by Impressions")
+                    fig.update_layout(height=420, margin=dict(l=8,r=8,b=120,t=40))
+                    st.plotly_chart(fig, use_container_width=True)
+                st.download_button(
+                    "Download table (CSV)",
+                    data=sub.to_csv(index=False).encode("utf-8"),
+                    file_name=f"demographics_{seg}.csv",
+                    mime="text/csv"
+                )
+    else:
+        # Fallback to the older dimension_value-based view
+        if PLOTLY_AVAILABLE:
+            demo_kpi = compute_kpis(df_demo.copy())
+            dim_candidates = ["dimension_value","company","industry","job_function","job_title","seniority","company_size","country"]
+            dim_col = st.selectbox("Dimension", [c for c in dim_candidates if c in demo_kpi.columns])
+            metric = st.selectbox("Metric", [c for c in ["impressions","clicks","spend","conversions","ctr","cpc","cpm","cvr","cpl"] if c in demo_kpi.columns], index=0)
+            cat_col = "dimension_value" if "dimension_value" in demo_kpi.columns else dim_col
+            grp = demo_kpi.groupby(cat_col, as_index=False).agg({
+                "impressions":"sum","clicks":"sum","spend":"sum","conversions":"sum"
+            })
+            grp = compute_kpis(grp)
+            top = grp.sort_values(metric, ascending=False).head(20)
+            fig3 = px.bar(top, x=cat_col, y=metric)
+            fig3.update_layout(height=420, margin=dict(l=8,r=8,b=120,t=40))
+            st.plotly_chart(fig3, use_container_width=True)
+            st.caption("Full table")
+            st.dataframe(grp.sort_values(metric, ascending=False), use_container_width=True)
+            if KALEIDO_AVAILABLE:
+                st.download_button("Download chart (PNG)", data=fig3.to_image(format="png"), file_name=f"demo_{metric}.png", mime="image/png")
 
     with st.expander("⚙️ Column Mapping (advanced)"):
         st.write("Map alternate LinkedIn headers to canonical names.")
@@ -808,6 +943,31 @@ def run_tests() -> None:
     scsv = "date;impressions;clicks\n2025-01-01;100;10\n"
     df_scsv = read_csv_safely(_io.StringIO(scsv))
     assert set(map(str.lower, df_scsv.columns)) >= {"date","impressions","clicks"}
+
+    # 10) Demographics segment parsing: groups under headers, drops aggregates, computes CTR/share
+    demo_like = pd.DataFrame({
+        "Whatever": [
+            "Company Name Segment",
+            "Acme Inc", "Globex", "Total",
+            "Company Industry Segment",
+            "Software", "Other", "Finance",
+            "Job Seniority Segment",
+            "Director", "Unknown", "Manager",
+        ],
+        "Impressions": [np.nan, 100, 200, 500, np.nan, 300, 400, 100, np.nan, 50, 60, 90],
+        "Clicks":      [np.nan, 10,  30,  99,  np.nan, 25,  0,   5,   np.nan, 5,  0,   9],
+    })
+    parsed = parse_demographics_segments(demo_like)
+    # Should drop Total/Other/Unknown
+    assert not parsed["dimension_value"].str.lower().isin({"total","other","unknown"}).any()
+    # Should include expected segments
+    assert set(parsed["dimension_type"].unique()) >= {"company","industry","seniority"}
+    # CTR computed where impressions > 0
+    row = parsed[(parsed["dimension_type"]=="company") & (parsed["dimension_value"]=="Acme Inc")].iloc[0]
+    assert round(row["ctr"], 4) == 0.10  # 10 / 100
+    # Share sums to ~1 per segment
+    shares = parsed.groupby("dimension_type")["share_impressions"].sum().round(6)
+    assert (shares >= 0.999999).all() and (shares <= 1.000001).all()
 
 
 # =============================================================================
