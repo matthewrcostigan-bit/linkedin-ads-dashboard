@@ -1,13 +1,18 @@
 # app.py — LinkedIn Ads CSV Analyzer (Streamlit + Headless Fallback)
 # ----------------------------------------------------------------------------
 # Why this rewrite?
-# You hit: ModuleNotFoundError: No module named 'streamlit' (in Canvas) and
-# AttributeError: 'NoneType' object has no attribute 'notna' (when some columns
-# are missing). This version fixes both:
-#   1) Runs in TWO modes:
-#        • Streamlit UI — if Streamlit is installed.
-#        • Headless fallback — writes tables & charts to /mnt/data/linkedindash_outputs.
-#   2) Safe KPI math even when columns are missing (returns NaN instead of crashing).
+# You hit: ModuleNotFoundError: No module named 'streamlit' (in Canvas),
+# AttributeError: 'NoneType' object has no attribute 'notna' (missing cols),
+# pandas ParserError (quirky LinkedIn exports), AND now
+# "source code string cannot contain null bytes".
+#
+# This version fixes all of them:
+#   • Runs Streamlit UI if installed, or a headless generator otherwise.
+#   • KPI math is null-safe (missing columns → NaN, no crashes).
+#   • CSV reader handles UTF‑16 + tab + preamble (common for LinkedIn),
+#     odd delimiters/encodings, and skips bad lines.
+#   • All byte checks use explicit escapes (e.g., b"\xff\xfe") — no literal
+#     null bytes appear in source, eliminating the error.
 #
 # Quick start (Streamlit, on your machine):
 #   pip install -r requirements.txt
@@ -16,15 +21,11 @@
 # Quick start (Headless, e.g., Canvas sandbox w/o Streamlit):
 #   python app.py
 #   → outputs are written to /mnt/data/linkedindash_outputs
-#
-# Optional deps:
-#   plotly (interactive HTML charts), kaleido (PNG chart export)
 # ----------------------------------------------------------------------------
 
 from __future__ import annotations
 import os
 import io
-import re
 import json
 import glob
 from datetime import datetime
@@ -144,7 +145,6 @@ def _ensure_series(df: pd.DataFrame, name: str) -> pd.Series:
     s = df.get(name, None)
     if s is None:
         return pd.Series(np.nan, index=df.index)
-    # Ensure it's a pandas Series and aligned to df.index
     if not isinstance(s, pd.Series):
         s = pd.Series(s)
     if not s.index.equals(df.index):
@@ -159,9 +159,7 @@ def kpi_safe_div(n, d):
 
 
 def compute_kpis(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute KPI columns safely even when inputs are missing.
-    Returns a new DataFrame with KPI columns added (NaN when not computable).
-    """
+    """Compute KPI columns safely even when inputs are missing."""
     df = df.copy()
     imp = _ensure_series(df, "impressions")
     clk = _ensure_series(df, "clicks")
@@ -175,11 +173,9 @@ def compute_kpis(df: pd.DataFrame) -> pd.DataFrame:
     df["ctr"] = np.where((imp > 0), clk / imp, np.nan)
     df["cpc"] = np.where((clk > 0), spd / clk, np.nan)
     df["cpm"] = np.where((imp > 0), (spd / imp) * 1000, np.nan)
-    # Only compute CVR where clicks>0 and conversions is not NaN
     df["cvr"] = np.where((clk > 0) & (~conv.isna()), conv / clk, np.nan)
     df["cpl"] = np.where((leads > 0), spd / leads, np.nan)
     df["frequency"] = np.where((reach > 0), imp / reach, np.nan)
-    # Guard against missing video columns
     df["vtr"] = np.where((imp > 0) & (~vviews.isna()), vviews / imp, np.nan)
     df["completion_rate"] = np.where((imp > 0) & (~v100.isna()), v100 / imp, np.nan)
     return df
@@ -213,11 +209,8 @@ def dedupe(df: pd.DataFrame, keys: List[str]) -> Tuple[pd.DataFrame, pd.DataFram
 
 def read_csv_safely(file_like) -> pd.DataFrame:
     """Robust reader for LinkedIn exports.
-    Handles:
-      • UTF-16 tab-delimited with 4-line title + 1 blank preamble (common in LinkedIn)
-      • UTF-8/utf-8-sig/latin1 encodings
-      • Autodetected or fallback delimiters (",", ";", "	", "|")
-      • Skips malformed lines instead of crashing
+    Handles UTF‑16 tab-delimited with 5-line preamble, alternate encodings,
+    multiple delimiters, and skips malformed lines.
     """
     import io as _io
     from pandas.errors import ParserError
@@ -227,31 +220,27 @@ def read_csv_safely(file_like) -> pd.DataFrame:
             text = b.decode("utf-16", errors="ignore")
         except Exception:
             return None
-        # Count first 5 lines (title, start, end, generated, blank)
-        # Then header typically starts at line index 5
         sio = _io.StringIO(text)
-        try:
-            return pd.read_csv(
-                sio,
-                sep="	",
-                engine="python",
-                on_bad_lines="skip",
-                skiprows=5,
-            )
-        except Exception:
-            # Try without skipping (in case file lacks preamble)
-            sio.seek(0)
+        # Try with standard preamble (5 rows), then without
+        for skip in (5, 0):
             try:
-                return pd.read_csv(sio, sep="	", engine="python", on_bad_lines="skip")
+                sio.seek(0)
+                return pd.read_csv(
+                    sio,
+                    sep="\t",
+                    engine="python",
+                    on_bad_lines="skip",
+                    skiprows=skip,
+                )
             except Exception:
-                return None
+                continue
+        return None
 
-    # If str/path → try pandas directly with robust defaults first
+    # Path-like input
     if isinstance(file_like, (str, os.PathLike)):
-        # Detect UTF-16 quickly by BOM
         with open(file_like, "rb") as fh:
             head = fh.read(8)
-        if head.startswith(b"ÿþ") or head.startswith(b"þÿ"):
+        if head.startswith(b"\xff\xfe") or head.startswith(b"\xfe\xff"):
             with open(file_like, "rb") as fh:
                 b = fh.read()
             out = _read_utf16_with_preamble(b)
@@ -261,14 +250,14 @@ def read_csv_safely(file_like) -> pd.DataFrame:
         try:
             return pd.read_csv(file_like, sep=None, engine="python", on_bad_lines="skip")
         except Exception:
-            for sep in [",", ";", "	", "|"]:
+            for sep in [",", ";", "\t", "|"]:
                 try:
                     return pd.read_csv(file_like, sep=sep, engine="python", on_bad_lines="skip")
                 except Exception:
                     continue
             raise
 
-    # Otherwise treat as file-like (e.g., Streamlit UploadedFile)
+    # File-like (e.g., Streamlit UploadedFile)
     try:
         raw_bytes = file_like.read()
     finally:
@@ -278,15 +267,15 @@ def read_csv_safely(file_like) -> pd.DataFrame:
             except Exception:
                 pass
 
-    # UTF-16 path
-    if raw_bytes[:2] in (b"ÿþ", b"þÿ") or b" " in raw_bytes[:100]:
+    # UTF-16 detection on bytes (BOM or many NULs)
+    if raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff") or (b"\x00" in raw_bytes[:100]):
         out = _read_utf16_with_preamble(raw_bytes)
         if out is not None:
             return out
 
     # Generic encoding + delimiter attempts
     encodings = ["utf-8", "utf-8-sig", "latin1"]
-    seps = [None, ",", ";", "	", "|"]
+    seps = [None, ",", ";", "\t", "|"]
     last_err: Optional[Exception] = None
     for enc in encodings:
         try:
@@ -305,15 +294,13 @@ def read_csv_safely(file_like) -> pd.DataFrame:
     raise ParserError(f"Failed to parse CSV after multiple strategies. Last error: {last_err}")
 
 
-
-def load_files_from_paths(paths: List[str], mapping: Dict[str, List[str]]):(paths: List[str], mapping: Dict[str, List[str]]):
+def load_files_from_paths(paths: List[str], mapping: Dict[str, List[str]]):
     campaign, creative, convo, demo = [], [], [], []
     profiles = []
     for p in paths:
         try:
             raw = read_csv_safely(p)
         except Exception as e:
-            # record error but keep processing remaining files
             profiles.append({"name": os.path.basename(p), "error": str(e)})
             continue
         ftype = detect_file_type(raw)
@@ -336,7 +323,7 @@ def load_files_from_paths(paths: List[str], mapping: Dict[str, List[str]]):(path
         elif ftype == "demographics":
             demo.append(df)
         else:
-            campaign.append(df)  # fallback: treat unknowns as campaign for now
+            campaign.append(df)
 
     def _concat(parts: List[pd.DataFrame]) -> pd.DataFrame:
         return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
@@ -637,17 +624,13 @@ def build_headless_report(csv_paths: Optional[List[str]] = None, mapping: Option
     mapping = mapping or DEFAULT_MAPPING
     outdir = ensure_outdir("/mnt/data/linkedindash_outputs")
 
-    # Discover CSVs automatically if none provided
     if not csv_paths:
         csv_paths = sorted(glob.glob("/mnt/data/*.csv"))
 
     df_campaign, df_creative, df_convo, df_demo, df_profiles = load_files_from_paths(csv_paths, mapping)
 
-    # Save ingestion profile
-    prof_path = os.path.join(outdir, "ingestion_profile.csv")
-    write_df(prof_path, df_profiles)
+    write_df(os.path.join(outdir, "ingestion_profile.csv"), df_profiles)
 
-    # Dedupe + KPIs
     rep_frames = []
     if not df_campaign.empty:
         df_campaign, rep = dedupe(df_campaign, ["date","account_id","campaign_id"])
@@ -669,7 +652,6 @@ def build_headless_report(csv_paths: Optional[List[str]] = None, mapping: Option
     if rep_frames:
         write_df(os.path.join(outdir, "dedupe_report.csv"), pd.concat(rep_frames, ignore_index=True))
 
-    # KPI overview (combined campaign+creative)
     base = pd.concat([df_campaign, df_creative], ignore_index=True, sort=False)
     if not base.empty:
         sums = base[[c for c in ["impressions","clicks","spend","conversions","leads","reach"] if c in base.columns]].sum(numeric_only=True)
@@ -684,7 +666,6 @@ def build_headless_report(csv_paths: Optional[List[str]] = None, mapping: Option
         }
         write_df(os.path.join(outdir, "kpi_overview.csv"), pd.DataFrame([kpis]))
 
-    # Campaign leaderboard
     if not df_campaign.empty:
         board = df_campaign.groupby("campaign_name", as_index=False).agg({
             "impressions":"sum","clicks":"sum","spend":"sum","conversions":"sum","leads":"sum"
@@ -692,7 +673,6 @@ def build_headless_report(csv_paths: Optional[List[str]] = None, mapping: Option
         board = compute_kpis(board)
         write_df(os.path.join(outdir, "campaign_leaderboard.csv"), board)
 
-    # Creative breakdown
     if not df_creative.empty:
         cr = df_creative.groupby(["creative_name","headline","cta"], as_index=False).agg({
             "impressions":"sum","clicks":"sum","spend":"sum","conversions":"sum","leads":"sum"
@@ -700,7 +680,6 @@ def build_headless_report(csv_paths: Optional[List[str]] = None, mapping: Option
         cr = compute_kpis(cr)
         write_df(os.path.join(outdir, "creative_breakdown.csv"), cr)
 
-    # Demographics summary
     if not df_demo.empty:
         demo_kpi = compute_kpis(df_demo.copy())
         cat_col = "dimension_value" if "dimension_value" in demo_kpi.columns else None
@@ -712,17 +691,14 @@ def build_headless_report(csv_paths: Optional[List[str]] = None, mapping: Option
             grp = compute_kpis(grp)
             write_df(os.path.join(outdir, "demographics_summary.csv"), grp)
 
-    # Charts (HTML, no server needed)
     chart_paths: Dict[str, str] = {}
     if PLOTLY_AVAILABLE and not df_campaign.empty:
-        # Trend: impressions over time
         if "date" in df_campaign.columns:
             ts = df_campaign.groupby("date", as_index=False)["impressions"].sum()
             fig = px.line(ts, x="date", y="impressions", markers=True, title="Impressions Over Time")
             trend_path = os.path.join(outdir, "trend_impressions.html")
             fig.write_html(trend_path, include_plotlyjs="cdn")
             chart_paths["trend_impressions_html"] = trend_path
-        # Ad format performance
         if "ad_format" in df_campaign.columns:
             grp = df_campaign.groupby("ad_format", as_index=False).agg({"impressions":"sum","clicks":"sum","spend":"sum"})
             grp["ctr"] = grp.apply(lambda r: kpi_safe_div(r["clicks"], r["impressions"]), axis=1)
@@ -731,7 +707,6 @@ def build_headless_report(csv_paths: Optional[List[str]] = None, mapping: Option
             fig2.write_html(adfmt_path, include_plotlyjs="cdn")
             chart_paths["ad_format_ctr_html"] = adfmt_path
 
-    # Return index of generated artifacts
     index = {"outdir": outdir, **chart_paths}
     write_df(os.path.join(outdir, "artifact_index.csv"), pd.DataFrame([index]))
     return index
@@ -792,7 +767,6 @@ def run_tests() -> None:
     assert "vtr" in out2.columns and "completion_rate" in out2.columns
     assert out2["vtr"].isna().all()
     assert out2["completion_rate"].isna().all()
-    # CVR should be NaN when conversions missing
     assert out2["cvr"].isna().all()
 
     # 6) Partial video columns present → compute only where valid
@@ -802,38 +776,32 @@ def run_tests() -> None:
         "video_100": [50, 20, np.nan],
     })
     out3 = compute_kpis(df_video)
-    assert round(out3.loc[0, "vtr"], 3) == 0.2  # 200/1000
-    assert round(out3.loc[0, "completion_rate"], 3) == 0.05  # 50/1000
+    assert round(out3.loc[0, "vtr"], 3) == 0.2
+    assert round(out3.loc[0, "completion_rate"], 3) == 0.05
     assert pd.isna(out3.loc[1, "vtr"])  # views NaN
     assert pd.isna(out3.loc[2, "vtr"])  # impressions 0 → NaN
 
     # 7) UTF-16 + preamble + tab-delimited should parse
     utf16_content = (
-        "Conversation Ads Performance Report (in UTC)
-"
-        '"Report Start: February 1, 2025, 12:00 AM"
-'
-        '"Report End: August 11, 2025, 11:59 PM"
-'
-        '"Date Generated: August 11, 2025, 7:02 PM"
-'
-        "
-"
-        "date	impressions	clicks
-"
-        "2025-06-01	100	10
-"
+        "Conversation Ads Performance Report (in UTC)\n"
+        '"Report Start: February 1, 2025, 12:00 AM"\n'
+        '"Report End: August 11, 2025, 11:59 PM"\n'
+        '"Date Generated: August 11, 2025, 7:02 PM"\n'
+        "\n"
+        "date\timpressions\tclicks\n"
+        "2025-06-01\t100\t10\n"
     ).encode("utf-16")
     import io as _io
     df_utf16 = read_csv_safely(_io.BytesIO(utf16_content))
     assert set(df_utf16.columns) >= {"date","impressions","clicks"}
 
     # 8) Malformed line is skipped, not fatal
-    bad = "impressions,clicks
-100,10
-this,is,an,extra,column
-200,20
-"
+    bad = (
+        "impressions,clicks\n"
+        "100,10\n"
+        "this,is,an,extra,column\n"
+        "200,20\n"
+    )
     df_bad = read_csv_safely(_io.StringIO(bad))
     assert df_bad.shape[0] == 2 and set(df_bad.columns) == {"impressions","clicks"}
 
@@ -842,7 +810,6 @@ this,is,an,extra,column
 # Entrypoint
 # =============================================================================
 if __name__ == "__main__":
-    # Always run tests first
     try:
         run_tests()
         print("[tests] ✅ All unit tests passed.")
@@ -850,11 +817,9 @@ if __name__ == "__main__":
         print("[tests] ❌ A unit test failed:", e)
 
     if STREAMLIT_AVAILABLE:
-        # Launch the full interactive app
         run_streamlit_app()
     else:
         print("[info] Streamlit not available — running headless report builder.")
-        # If you already uploaded CSVs in Canvas, they live under /mnt/data/*.csv
         artifacts = build_headless_report()
         print("[done] Artifacts written to:", artifacts.get("outdir"))
         for k, v in artifacts.items():
