@@ -1,26 +1,28 @@
 # app.py — LinkedIn Ads CSV Analyzer (Streamlit + Headless Fallback)
 # ----------------------------------------------------------------------------
 # Why this rewrite?
-# You hit: ModuleNotFoundError: No module named 'streamlit' (in Canvas),
-# AttributeError: 'NoneType' object has no attribute 'notna' (missing cols),
-# pandas ParserError (quirky LinkedIn exports), AND now
-# "source code string cannot contain null bytes".
+# You hit a few issues across environments:
+#  • streamlit not installed (Canvas)
+#  • NoneType .notna() when columns missing
+#  • pandas ParserError on quirky LinkedIn exports (UTF‑16, tabs, preamble)
+#  • "source code string cannot contain null bytes" (fixed by using escapes)
+#  • TypeError: 'in <string>' requires string as left operand, not bytes
+#    → caused by checking bytes against a str when uploads come via StringIO.
 #
-# This version fixes all of them:
-#   • Runs Streamlit UI if installed, or a headless generator otherwise.
-#   • KPI math is null-safe (missing columns → NaN, no crashes).
-#   • CSV reader handles UTF‑16 + tab + preamble (common for LinkedIn),
-#     odd delimiters/encodings, and skips bad lines.
-#   • All byte checks use explicit escapes (e.g., b"\xff\xfe") — no literal
-#     null bytes appear in source, eliminating the error.
+# This version fixes all of them. Highlights:
+#  • Streamlit UI if available, headless file outputs otherwise
+#  • KPI math is null-safe
+#  • CSV reader detects UTF‑16 + tab + 5‑line preamble, tries multiple encodings
+#    and delimiters, and tolerates malformed rows
+#  • Bytes vs. text uploads are handled explicitly to avoid TypeError
 #
-# Quick start (Streamlit, on your machine):
+# Quick start (Streamlit):
 #   pip install -r requirements.txt
 #   streamlit run app.py
 #
-# Quick start (Headless, e.g., Canvas sandbox w/o Streamlit):
+# Quick start (Headless):
 #   python app.py
-#   → outputs are written to /mnt/data/linkedindash_outputs
+#   → outputs to /mnt/data/linkedindash_outputs
 # ----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -210,7 +212,8 @@ def dedupe(df: pd.DataFrame, keys: List[str]) -> Tuple[pd.DataFrame, pd.DataFram
 def read_csv_safely(file_like) -> pd.DataFrame:
     """Robust reader for LinkedIn exports.
     Handles UTF‑16 tab-delimited with 5-line preamble, alternate encodings,
-    multiple delimiters, and skips malformed lines.
+    multiple delimiters, and skips malformed lines. Works with *either* bytes
+    (UploadedFile/BytesIO/path) or text (StringIO) to avoid bytes↔str TypeErrors.
     """
     import io as _io
     from pandas.errors import ParserError
@@ -225,73 +228,69 @@ def read_csv_safely(file_like) -> pd.DataFrame:
         for skip in (5, 0):
             try:
                 sio.seek(0)
-                return pd.read_csv(
-                    sio,
-                    sep="\t",
-                    engine="python",
-                    on_bad_lines="skip",
-                    skiprows=skip,
-                )
+                return pd.read_csv(sio, sep="\t", engine="python", on_bad_lines="skip", skiprows=skip)
             except Exception:
                 continue
         return None
 
-    # Path-like input
-    if isinstance(file_like, (str, os.PathLike)):
-        with open(file_like, "rb") as fh:
-            head = fh.read(8)
-        if head.startswith(b"\xff\xfe") or head.startswith(b"\xfe\xff"):
-            with open(file_like, "rb") as fh:
-                b = fh.read()
+    def _parse_text(text: str) -> Optional[pd.DataFrame]:
+        sio = _io.StringIO(text)
+        for sep in (None, ",", ";", "\t", "|"):
+            try:
+                sio.seek(0)
+                return pd.read_csv(sio, sep=sep, engine="python", on_bad_lines="skip")
+            except Exception:
+                continue
+        return None
+
+    def _parse_bytes(b: bytes) -> Optional[pd.DataFrame]:
+        # Detect UTF‑16 via BOM or presence of NULs
+        if b[:2] in (b"\xff\xfe", b"\xfe\xff") or (b.find(b"\x00") != -1):
             out = _read_utf16_with_preamble(b)
             if out is not None:
                 return out
-        # Fallback attempts
-        try:
-            return pd.read_csv(file_like, sep=None, engine="python", on_bad_lines="skip")
-        except Exception:
-            for sep in [",", ";", "\t", "|"]:
-                try:
-                    return pd.read_csv(file_like, sep=sep, engine="python", on_bad_lines="skip")
-                except Exception:
-                    continue
-            raise
-
-    # File-like (e.g., Streamlit UploadedFile)
-    try:
-        raw_bytes = file_like.read()
-    finally:
-        if hasattr(file_like, "seek"):
+        for enc in ("utf-8", "utf-8-sig", "latin1"):
             try:
-                file_like.seek(0)
+                text = b.decode(enc, errors="ignore")
             except Exception:
-                pass
+                continue
+            out = _parse_text(text)
+            if out is not None:
+                return out
+        return None
 
-    # UTF-16 detection on bytes (BOM or many NULs)
-    if raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff") or (b"\x00" in raw_bytes[:100]):
-        out = _read_utf16_with_preamble(raw_bytes)
+    # 1) Path-like → read bytes then parse
+    if isinstance(file_like, (str, os.PathLike)):
+        with open(file_like, "rb") as fh:
+            b = fh.read()
+        out = _parse_bytes(b)
         if out is not None:
             return out
+        raise ParserError("Failed to parse CSV from path after multiple strategies")
 
-    # Generic encoding + delimiter attempts
-    encodings = ["utf-8", "utf-8-sig", "latin1"]
-    seps = [None, ",", ";", "\t", "|"]
-    last_err: Optional[Exception] = None
-    for enc in encodings:
+    # 2) File-like object → read *once*, then branch by type
+    data = file_like.read()
+    # If the object is seekable, rewind for upstream consumers
+    if hasattr(file_like, "seek"):
         try:
-            text = raw_bytes.decode(enc, errors="ignore")
-        except Exception as e:
-            last_err = e
-            continue
-        sio = _io.StringIO(text)
-        for sep in seps:
-            try:
-                return pd.read_csv(sio, sep=sep, engine="python", on_bad_lines="skip")
-            except Exception as e:
-                last_err = e
-                sio.seek(0)
-                continue
-    raise ParserError(f"Failed to parse CSV after multiple strategies. Last error: {last_err}")
+            file_like.seek(0)
+        except Exception:
+            pass
+
+    if isinstance(data, bytes):
+        out = _parse_bytes(data)
+        if out is not None:
+            return out
+    else:  # string-like (e.g., StringIO)
+        if isinstance(data, str):
+            out = _parse_text(data)
+            if out is not None:
+                return out
+            # Last-ditch: encode to bytes and try bytes path
+            out = _parse_bytes(data.encode("utf-8", errors="ignore"))
+            if out is not None:
+                return out
+    raise ParserError("Failed to parse CSV after multiple strategies (file-like)")
 
 
 def load_files_from_paths(paths: List[str], mapping: Dict[str, List[str]]):
@@ -795,7 +794,7 @@ def run_tests() -> None:
     df_utf16 = read_csv_safely(_io.BytesIO(utf16_content))
     assert set(df_utf16.columns) >= {"date","impressions","clicks"}
 
-    # 8) Malformed line is skipped, not fatal
+    # 8) Malformed line is skipped, not fatal (StringIO → text path)
     bad = (
         "impressions,clicks\n"
         "100,10\n"
@@ -804,6 +803,11 @@ def run_tests() -> None:
     )
     df_bad = read_csv_safely(_io.StringIO(bad))
     assert df_bad.shape[0] == 2 and set(df_bad.columns) == {"impressions","clicks"}
+
+    # 9) Semicolon-delimited via StringIO should parse
+    scsv = "date;impressions;clicks\n2025-01-01;100;10\n"
+    df_scsv = read_csv_safely(_io.StringIO(scsv))
+    assert set(map(str.lower, df_scsv.columns)) >= {"date","impressions","clicks"}
 
 
 # =============================================================================
