@@ -1,0 +1,9 @@
+streamlit
+plotly
+kaleido
+pandas
+numpy
+duckdb
+polars
+openpyxl
+python-pptx
