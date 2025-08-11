@@ -212,24 +212,108 @@ def dedupe(df: pd.DataFrame, keys: List[str]) -> Tuple[pd.DataFrame, pd.DataFram
 # =============================================================================
 
 def read_csv_safely(file_like) -> pd.DataFrame:
+    """Robust reader for LinkedIn exports.
+    Handles:
+      • UTF-16 tab-delimited with 4-line title + 1 blank preamble (common in LinkedIn)
+      • UTF-8/utf-8-sig/latin1 encodings
+      • Autodetected or fallback delimiters (",", ";", "	", "|")
+      • Skips malformed lines instead of crashing
+    """
+    import io as _io
+    from pandas.errors import ParserError
+
+    def _read_utf16_with_preamble(b: bytes) -> Optional[pd.DataFrame]:
+        try:
+            text = b.decode("utf-16", errors="ignore")
+        except Exception:
+            return None
+        # Count first 5 lines (title, start, end, generated, blank)
+        # Then header typically starts at line index 5
+        sio = _io.StringIO(text)
+        try:
+            return pd.read_csv(
+                sio,
+                sep="	",
+                engine="python",
+                on_bad_lines="skip",
+                skiprows=5,
+            )
+        except Exception:
+            # Try without skipping (in case file lacks preamble)
+            sio.seek(0)
+            try:
+                return pd.read_csv(sio, sep="	", engine="python", on_bad_lines="skip")
+            except Exception:
+                return None
+
+    # If str/path → try pandas directly with robust defaults first
+    if isinstance(file_like, (str, os.PathLike)):
+        # Detect UTF-16 quickly by BOM
+        with open(file_like, "rb") as fh:
+            head = fh.read(8)
+        if head.startswith(b"ÿþ") or head.startswith(b"þÿ"):
+            with open(file_like, "rb") as fh:
+                b = fh.read()
+            out = _read_utf16_with_preamble(b)
+            if out is not None:
+                return out
+        # Fallback attempts
+        try:
+            return pd.read_csv(file_like, sep=None, engine="python", on_bad_lines="skip")
+        except Exception:
+            for sep in [",", ";", "	", "|"]:
+                try:
+                    return pd.read_csv(file_like, sep=sep, engine="python", on_bad_lines="skip")
+                except Exception:
+                    continue
+            raise
+
+    # Otherwise treat as file-like (e.g., Streamlit UploadedFile)
     try:
-        return pd.read_csv(file_like, engine="python")
-    except Exception:
+        raw_bytes = file_like.read()
+    finally:
         if hasattr(file_like, "seek"):
             try:
                 file_like.seek(0)
             except Exception:
                 pass
-        return pd.read_csv(file_like, encoding_errors="ignore")
+
+    # UTF-16 path
+    if raw_bytes[:2] in (b"ÿþ", b"þÿ") or b" " in raw_bytes[:100]:
+        out = _read_utf16_with_preamble(raw_bytes)
+        if out is not None:
+            return out
+
+    # Generic encoding + delimiter attempts
+    encodings = ["utf-8", "utf-8-sig", "latin1"]
+    seps = [None, ",", ";", "	", "|"]
+    last_err: Optional[Exception] = None
+    for enc in encodings:
+        try:
+            text = raw_bytes.decode(enc, errors="ignore")
+        except Exception as e:
+            last_err = e
+            continue
+        sio = _io.StringIO(text)
+        for sep in seps:
+            try:
+                return pd.read_csv(sio, sep=sep, engine="python", on_bad_lines="skip")
+            except Exception as e:
+                last_err = e
+                sio.seek(0)
+                continue
+    raise ParserError(f"Failed to parse CSV after multiple strategies. Last error: {last_err}")
 
 
-def load_files_from_paths(paths: List[str], mapping: Dict[str, List[str]]):
+
+def load_files_from_paths(paths: List[str], mapping: Dict[str, List[str]]):(paths: List[str], mapping: Dict[str, List[str]]):
     campaign, creative, convo, demo = [], [], [], []
     profiles = []
     for p in paths:
         try:
             raw = read_csv_safely(p)
         except Exception as e:
+            # record error but keep processing remaining files
             profiles.append({"name": os.path.basename(p), "error": str(e)})
             continue
         ftype = detect_file_type(raw)
@@ -252,7 +336,7 @@ def load_files_from_paths(paths: List[str], mapping: Dict[str, List[str]]):
         elif ftype == "demographics":
             demo.append(df)
         else:
-            campaign.append(df)  # fallback
+            campaign.append(df)  # fallback: treat unknowns as campaign for now
 
     def _concat(parts: List[pd.DataFrame]) -> pd.DataFrame:
         return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
@@ -297,7 +381,11 @@ def run_streamlit_app():
         campaign, creative, convo, demo = [], [], [], []
         profiles = []
         for f in _files:
-            raw = read_csv_safely(f)
+            try:
+                raw = read_csv_safely(f)
+            except Exception as e:
+                st.error(f"Failed to read {getattr(f, 'name', 'uploaded file')}: {e}")
+                continue
             ftype = detect_file_type(raw)
             df = canonicalize_columns(raw, mapping)
             prof = {
@@ -718,6 +806,36 @@ def run_tests() -> None:
     assert round(out3.loc[0, "completion_rate"], 3) == 0.05  # 50/1000
     assert pd.isna(out3.loc[1, "vtr"])  # views NaN
     assert pd.isna(out3.loc[2, "vtr"])  # impressions 0 → NaN
+
+    # 7) UTF-16 + preamble + tab-delimited should parse
+    utf16_content = (
+        "Conversation Ads Performance Report (in UTC)
+"
+        '"Report Start: February 1, 2025, 12:00 AM"
+'
+        '"Report End: August 11, 2025, 11:59 PM"
+'
+        '"Date Generated: August 11, 2025, 7:02 PM"
+'
+        "
+"
+        "date	impressions	clicks
+"
+        "2025-06-01	100	10
+"
+    ).encode("utf-16")
+    import io as _io
+    df_utf16 = read_csv_safely(_io.BytesIO(utf16_content))
+    assert set(df_utf16.columns) >= {"date","impressions","clicks"}
+
+    # 8) Malformed line is skipped, not fatal
+    bad = "impressions,clicks
+100,10
+this,is,an,extra,column
+200,20
+"
+    df_bad = read_csv_safely(_io.StringIO(bad))
+    assert df_bad.shape[0] == 2 and set(df_bad.columns) == {"impressions","clicks"}
 
 
 # =============================================================================
