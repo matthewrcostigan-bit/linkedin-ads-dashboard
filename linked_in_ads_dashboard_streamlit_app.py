@@ -298,22 +298,24 @@ def parse_demographics_segments(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def read_csv_safely(file_like) -> pd.DataFrame:
-    """Robust reader for LinkedIn exports.
-    Handles UTF‑16 tab-delimited with 5-line preamble, alternate encodings,
-    multiple delimiters, and skips malformed lines. Works with *either* bytes
-    (UploadedFile/BytesIO/path) or text (StringIO) to avoid bytes↔str TypeErrors.
+    """
+    Robust reader for LinkedIn exports.
+    - Handles UTF-16 with tab + 5-line preamble
+    - Tries multiple encodings (utf-16, utf-8, utf-8-sig, latin1)
+    - Tries autodetected and common delimiters
+    - Skips malformed lines
+    Works with paths, UploadedFile/BytesIO (bytes), and StringIO (text).
     """
     import io as _io
     from pandas.errors import ParserError
 
-    def _read_utf16_with_preamble(b: bytes) -> Optional[pd.DataFrame]:
+    def _read_utf16_with_preamble(b: bytes):
         try:
             text = b.decode("utf-16", errors="ignore")
         except Exception:
             return None
         sio = _io.StringIO(text)
-        # Try with standard preamble (5 rows), then without
-        for skip in (5, 0):
+        for skip in (5, 0):  # LinkedIn often has a 4-line title + blank
             try:
                 sio.seek(0)
                 return pd.read_csv(sio, sep="\t", engine="python", on_bad_lines="skip", skiprows=skip)
@@ -321,7 +323,7 @@ def read_csv_safely(file_like) -> pd.DataFrame:
                 continue
         return None
 
-    def _parse_text(text: str) -> Optional[pd.DataFrame]:
+    def _parse_text(text: str):
         sio = _io.StringIO(text)
         for sep in (None, ",", ";", "\t", "|"):
             try:
@@ -331,8 +333,7 @@ def read_csv_safely(file_like) -> pd.DataFrame:
                 continue
         return None
 
-    def _parse_bytes(b: bytes) -> Optional[pd.DataFrame]:
-        # Detect UTF‑16 via BOM or presence of NULs
+    def _parse_bytes(b: bytes):
         if b[:2] in (b"\xff\xfe", b"\xfe\xff") or (b.find(b"\x00") != -1):
             out = _read_utf16_with_preamble(b)
             if out is not None:
@@ -347,7 +348,7 @@ def read_csv_safely(file_like) -> pd.DataFrame:
                 return out
         return None
 
-    # 1) Path-like → read bytes then parse
+    # Path-like
     if isinstance(file_like, (str, os.PathLike)):
         with open(file_like, "rb") as fh:
             b = fh.read()
@@ -356,29 +357,27 @@ def read_csv_safely(file_like) -> pd.DataFrame:
             return out
         raise ParserError("Failed to parse CSV from path after multiple strategies")
 
-    # 2) File-like object → read *once*, then branch by type
+    # File-like (UploadedFile / BytesIO / StringIO)
     data = file_like.read()
-    # If the object is seekable, rewind for upstream consumers
     if hasattr(file_like, "seek"):
-        try:
-            file_like.seek(0)
-        except Exception:
-            pass
+        try: file_like.seek(0)
+        except Exception: pass
 
     if isinstance(data, bytes):
         out = _parse_bytes(data)
         if out is not None:
             return out
-    else:  # string-like (e.g., StringIO)
-        if isinstance(data, str):
-            out = _parse_text(data)
-            if out is not None:
-                return out
-            # Last-ditch: encode to bytes and try bytes path
-            out = _parse_bytes(data.encode("utf-8", errors="ignore"))
-            if out is not None:
-                return out
+    elif isinstance(data, str):
+        out = _parse_text(data)
+        if out is not None:
+            return out
+        # last-ditch
+        out = _parse_bytes(data.encode("utf-8", errors="ignore"))
+        if out is not None:
+            return out
+
     raise ParserError("Failed to parse CSV after multiple strategies (file-like)")
+
 
 
 def load_files_from_paths(paths: List[str], mapping: Dict[str, List[str]]):
